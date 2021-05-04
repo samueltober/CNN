@@ -3,13 +3,14 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 from scipy.linalg import block_diag
 import pandas as pd
+from collections import defaultdict
 from sklearn.metrics import f1_score
 
 np.random.seed(123)
 
 
 class ConvNet:
-    def __init__(self, no_filters_layer, filter_widths, X_tr, Y_tr, X_val, Y_val, d, K, n_len):
+    def __init__(self, no_filters_layer, filter_widths, X_tr, Y_tr, X_val, Y_val, d, K, n_len, dropout_prob=1):
         self.X_train, self.X_val = X_tr, X_val
         self.Y_train, self.Y_val = Y_tr, Y_val
         self.d = d
@@ -26,6 +27,9 @@ class ConvNet:
 
         # Initialize filters, W and n_len
         self.initialize_cnn()
+
+        self._keep_prob = dropout_prob
+        self._mask = None
 
     def initialize_cnn(self):
         d = self.d
@@ -45,6 +49,11 @@ class ConvNet:
             sig_i = np.sqrt(2 / n[i - 1])
             self.filters.append(np.random.normal(0, sig_i, (n[i - 1], k[i], n[i])))
 
+    def _apply_mask(self, array, mask):
+        array *= mask
+        array /= self._keep_prob
+        return array
+
     def evaluate(self, X_batch):
         x = X_batch
         x_record = [x]
@@ -53,6 +62,9 @@ class ConvNet:
             MF = self.make_MF_matrix(self.n_len[i], self.filters[i])
             x = np.maximum(0, MF @ x)
             x_record.append(x)
+
+        self._mask = (np.random.rand(*x.shape) < self._keep_prob)
+        self._apply_mask(x, self._mask)
 
         s = self.W @ x
 
@@ -66,17 +78,24 @@ class ConvNet:
 
     def compute_accuracy(self, X, Y):
         p, _ = self.evaluate(X)
-        y = np.argmax(Y, axis=0)
-        predicted = np.argmax(p, axis=0)
-        acc = (predicted == y).mean()
+        count = 0
+
+        for i in range(Y.shape[1]):
+            col = Y[:, i]
+            winner = np.argwhere(col == np.amax(col)).flatten().tolist()
+            predicted = np.argmax(p[:, i])
+            if predicted in winner:
+                count += 1
+
+        acc = count / Y.shape[1]
 
         return acc
 
     def compute_gradients(self, X_batch, Y_batch):
         p_batch, x_record = self.evaluate(X_batch)
+        n = x_record[-1].shape[1]
         g_batch = -(Y_batch - p_batch)
 
-        n = x_record[-1].shape[1]
         grad_W = (1 / n) * g_batch @ x_record[-1].T
         grad_F = []
 
@@ -88,13 +107,14 @@ class ConvNet:
         for i in range(len(x_record)-2, -1, -1):  # Start at the end, exclude the last & first batch
             grad = np.zeros(self.filters[i].shape)
             x = x_record[i]
+
             for j in range(n):
                 g_j = g_batch[:, j]
                 x_j = x[:, j]
 
                 d, k, nf = self.filters[i].shape[0], self.filters[i].shape[1], self.filters[i].shape[2]
                 MX = self.make_MX_matrix(x_j, d, k, nf, int(self.n_len[i]))
-                v = g_j.T @ MX
+                v = g_j @ MX
                 grad += (1 / n) * v.reshape(grad.shape, order='F')
 
             grad_F.append(grad)
@@ -139,8 +159,8 @@ class ConvNet:
 
         return grad_F, grad_W
 
-    def mini_batch_gd(self, n_batch, eta, rho, n_epochs, plot=False, balanced=False):
-        n_step = 10
+    def mini_batch_gd(self, n_batch, eta, rho, n_epochs, lr_decay=0.9, plot=False, balanced=False):
+        n_step = 50
         train_costs = []
         val_costs = []
 
@@ -186,6 +206,7 @@ class ConvNet:
 
                 prev_grad_F = np.copy(grad_F)
                 prev_grad_W = np.copy(grad_W)
+                eta *= lr_decay
 
         if plot:
             plt.plot([n_step*i for i in range(len(train_costs))], train_costs, label='Training Cost')
@@ -196,7 +217,7 @@ class ConvNet:
             plt.title("Training and Validation Cost")
             plt.show()
 
-        print(max(val_accuracy), max(train_accuracy))
+        #print(max(val_accuracy), max(train_accuracy))
         self.W = curr_best[0]
         self.filters = curr_best[1]
 
@@ -247,13 +268,22 @@ class ConvNet:
 
     @staticmethod
     def upsample(X, Y):
-        labels = np.argmax(Y, axis=0)
-        data_per_class = dict((x, list(labels).count(x)) for x in set(list(labels)))
+        all_labels = []
+        labels = []
+
+        for i in range(Y.shape[1]):
+            col = Y[:, i]
+            multi_label = np.argwhere(col == np.amax(col)).flatten().tolist()
+            labels.append(multi_label)
+            for label in multi_label:
+                all_labels.append(label)
+
+        data_per_class = dict((x, list(all_labels).count(x)) for x in set(list(all_labels)))
         min_label = min(data_per_class.values())
         indices = np.asarray([])
 
-        for label in set(labels):
-            subset = np.where(labels == label)
+        for label in set(all_labels):
+            subset = np.where([label in multi_label for multi_label in labels])
             idx = np.random.choice(subset[0], size=min_label, replace=False)
             indices = np.concatenate([indices, idx])
 
@@ -265,21 +295,38 @@ class ConvNet:
 
 class DataLoader:
     def __init__(self):
-        self.name_path = "C:/Users/g022191/PycharmProjects/DD2424/Lab_3/Data/ascii_names.txt"
+        self.name_path = "C:/Users/g022191/PycharmProjects/DD2424/Lab_3/Data/ascii_names_with_multi_label.txt"
         self.names, self.labels = self.read_names_and_labels(self.name_path)
+        self.character_dict = {}
         self.n_len = -1
         self.d = 0
         self.K = 0
 
     @staticmethod
-    def read_names_and_labels(file_path):
+    def list_duplicates(seq):
+        tally = defaultdict(list)
+        for i, item in enumerate(seq):
+            tally[item].append(i)
+
+        return ((key, locs) for key, locs in tally.items())
+
+    def read_names_and_labels(self, file_path):
+        names_temp = []
+        labels_temp = []
         names = []
         labels = []
+
         with open(file_path, "r") as f:
             for line in f:
                 split_fields = line.split(" ")
-                names.append(' '.join(split_fields[:-1]))  # Append name
-                labels.append(split_fields[-1])  # Append label
+                names_temp.append(' '.join(split_fields[:-1]))  # Append name
+                labels_temp.append(split_fields[-1])  # Append label
+
+        labels_temp = np.asarray(labels_temp)
+
+        for dup in sorted(self.list_duplicates(names_temp)):
+            names.append(dup[0])
+            labels.append([int(el) for el in labels_temp[dup[1]]])
 
         return names, labels
 
@@ -292,15 +339,16 @@ class DataLoader:
         return encoded_string
 
     @staticmethod
-    def one_hot_encoding(label_id, label_no):
+    def one_hot_encoding(labels_id, label_no):
         vector = np.zeros(label_no)
-        vector[label_id] = 1
+        labels_id = [label - 1 for label in labels_id]
+        vector[labels_id] = 1 / len(labels_id)
+
         return vector
 
     def get_dataset(self):
         self.n_len = -1  # Maximum name length
         char_idx = 0
-        character_dict = {}
 
         for name in self.names:
             # Compare current length with maximum name length
@@ -309,27 +357,28 @@ class DataLoader:
                 self.n_len = cur_len
             # Store any previously unseen characters into dictionary
             for character in name:
-                if character not in character_dict.keys():
-                    character_dict[character] = char_idx
+                if character not in self.character_dict.keys():
+                    self.character_dict[character] = char_idx
                     char_idx += 1
-        labels = np.array(self.labels, dtype=int)
-        self.d = len(character_dict)  # number of unique characters
-        self.K = len(np.unique(labels))  # number of unique classes
+
+        count_list = []
+        for label in self.labels:
+            for el in label:
+                count_list.append(el)
+
+        self.d = len(self.character_dict)  # number of unique characters
+        self.K = len(np.unique(count_list))  # number of unique classes
+        labels = np.asarray(self.labels)
 
         vectorized_input_size = self.d * self.n_len
-        X = np.zeros((vectorized_input_size, len(self.names)))
-        for idx, name in enumerate(self.names):
-            X[:, idx] = self.encode_string(name, character_dict, self.n_len).flatten(order='F')
-
-        test_names, test_labels = self.read_names_and_labels("C:/Users/g022191/PycharmProjects/DD2424/Lab_3/Data/test_names")
-        X_test = np.zeros((vectorized_input_size, len(test_names)))
-        for idx, name in enumerate(test_names):
-            X_test[:, idx] = self.encode_string(name, character_dict, self.n_len).flatten(order='F')
+        X = np.zeros((vectorized_input_size, len(np.unique(self.names))))
+        for idx, name in enumerate(np.unique(self.names)):
+            X[:, idx] = self.encode_string(name, self.character_dict, self.n_len).flatten(order='F')
 
         # One-hot encoding for output
-        Y = np.array([self.one_hot_encoding(label - 1, self.K) for label in labels]).T
+        Y = np.array([self.one_hot_encoding(label, self.K) for label in labels]).T
 
-        return X, Y, X_test
+        return X, Y
 
 
 def getRelativeErrors(grads_numerical, grads_analytical, eps=1e-6):
@@ -358,7 +407,7 @@ def check_gradients(CNN, X, Y):
 
 def main():
     data_loader = DataLoader()
-    X, Y, X_test = data_loader.get_dataset()
+    X, Y = data_loader.get_dataset()
 
     # Get the indices of the inputs that are going to used in the validation set
     val_ind_path = "C:/Users/g022191/PycharmProjects/DD2424/Lab_3/Data/Validation_Inds.txt"
@@ -375,38 +424,45 @@ def main():
     np.random.shuffle(indices)
     X_tr, Y_tr = X_tr[:, indices], Y_tr[:, indices]
 
-    # Check distribution of classes
-    data_per_class = dict((x, list(np.argmax(Y_val, axis=0)).count(x)) for x in set(list(np.argmax(Y_val, axis=0))))
-    factor = 100.0 / sum(data_per_class.values())
-    for k in data_per_class:
-        data_per_class[k] = round(data_per_class[k] * factor, 2)
-
-    print(data_per_class)
-
     # Train CNN
-    CNN = ConvNet(no_filters_layer=(50, 50),
-                  filter_widths=(5, 3),
+    CNN = ConvNet(no_filters_layer=(20, 20, 20, 20),  # Here it is possible to add a list of any size, arbitrary no. conv layers
+                  filter_widths=(5, 5, 5, 3),
                   X_tr=X_tr,
                   Y_tr=Y_tr,
                   X_val=X_val,
                   Y_val=Y_val,
                   d=data_loader.d,
                   K=data_loader.K,
-                  n_len=data_loader.n_len)
+                  n_len=data_loader.n_len,
+                  dropout_prob=1)
 
-    CNN.mini_batch_gd(n_batch=10,
-                      n_epochs=10,  # 20 000 steps = 2223 for balanced, 117 for imbalanced
-                      eta=0.001,
+    check_gradients(CNN, X, Y)
+
+    CNN.mini_batch_gd(n_batch=100,
+                      n_epochs=250,  # 20 000 steps = 2223 for balanced, 117 for imbalanced
+                      eta=0.01,
                       rho=0.9,
+                      lr_decay=1,
                       plot=True,
                       balanced=True)
+
+    # Evaluate on test data
+    #y_test = np.argmax(Y_test, axis=0)
+    #pred_test = CNN.predict(X_test)
+    #p_test, _ = CNN.evaluate(X_test)
+
+    #print(("Actual", "Predicted"), list(zip(y_test, pred_test)))
+
+    #for i in range(len(test_names)):
+    #    print(test_names[i] + ": ", p_test[:, 0])
+    #    print("\n")
 
     # Evaluate CNN
     y = pd.Series(np.argmax(Y_val, axis=0), name="Actual")
     pred = pd.Series(CNN.predict(X_val), name="pred")
     df_confusion = pd.crosstab(y, pred)
 
-    print(CNN.compute_class_accuracy(X_val, Y_val))
+    #print(CNN.compute_class_accuracy(X_val, Y_val))
     print(df_confusion)
     print(f1_score(y, pred, average='weighted'))
 
